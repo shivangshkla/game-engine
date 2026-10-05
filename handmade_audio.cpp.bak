@@ -1,0 +1,199 @@
+function playing_sound *
+PlaySound(game_audio_state *AudioState, sound_id ID)
+{
+    if(!AudioState->FirstFreePlayingSound)
+    {
+        AudioState->FirstFreePlayingSound = PushStruct(AudioState->PermanentArena, playing_sound);
+        AudioState->FirstFreePlayingSound->Next = 0;
+    }
+
+    playing_sound *PlayingSound = AudioState->FirstFreePlayingSound;
+    AudioState->FirstFreePlayingSound = AudioState->FirstFreePlayingSound->Next;
+
+    PlayingSound->CurrentVolume = PlayingSound->TargetVolume = V2(0.1f, 0.1f);
+    PlayingSound->dCurrentVolume = V2(0, 0);
+    PlayingSound->ID = ID;
+    PlayingSound->SamplesPlayed = 0;
+
+    PlayingSound->Next = AudioState->FirstPlayingSound;
+    AudioState->FirstPlayingSound = PlayingSound;
+
+    return(PlayingSound);
+}
+
+function void
+ChangeVolume(game_audio_state *AudioState, playing_sound *Sound, v2 Volume,
+             f32 FadeDurationInSeconds)
+{
+    if(FadeDurationInSeconds <= 0.0f)
+    {
+        Sound->CurrentVolume = Sound->TargetVolume = Volume;
+    }
+    else
+    {
+        Sound->TargetVolume = Volume;
+        Sound->dCurrentVolume = (1.0f/FadeDurationInSeconds)*(Sound->TargetVolume - Sound->CurrentVolume);
+    }
+}
+
+function void
+OutputPlayingSounds(game_audio *Audio, game_audio_state *AudioState, game_assets *Assets, memory_arena *TempArena)
+{
+    temporary_memory MixerMemory = BeginTemporaryMemory(TempArena);
+
+#define OutputChannelCount 2
+    f32 *RealChannel0 = PushArray(TempArena, Audio->SampleCount, f32);
+    f32 *RealChannel1 = PushArray(TempArena, Audio->SampleCount, f32);
+
+    {
+        f32 *Dest0 = RealChannel0;
+        f32 *Dest1 = RealChannel1;
+        for(s32 SampleIndex = 0;
+            SampleIndex < Audio->SampleCount;
+            ++SampleIndex)
+        {
+            *Dest0++ = 0.0f;
+            *Dest1++ = 0.0f;
+        }
+    }
+
+    for(playing_sound **PlayingSoundPtr = &AudioState->FirstPlayingSound;
+        *PlayingSoundPtr;
+        )
+    {
+        playing_sound *PlayingSound = *PlayingSoundPtr;
+
+        b32 SoundFinished = false;
+
+        f32 *Dest0 = RealChannel0;
+        f32 *Dest1 = RealChannel1;
+
+        s32 TotalSamplesToMix = Audio->SampleCount;
+        while(TotalSamplesToMix && !SoundFinished)
+        {
+            asset_slot *Slot = GetSoundSlot(Assets, PlayingSound->ID);
+            if(Slot->State == AssetState_Loaded)
+            {
+                asset_sound_info *Info = GetSoundInfo(Assets, PlayingSound->ID);
+                PrefetchSound(Assets, Info->NextIDToPlay);
+
+                v2 Volume = PlayingSound->CurrentVolume;
+                v2 dVolume = (1.0f / Audio->SampleRate)*PlayingSound->dCurrentVolume;
+
+                Assert(PlayingSound->SamplesPlayed >= 0);
+
+                s32 SamplesToMix = TotalSamplesToMix;
+                s32 SamplesRemainingInSound = Slot->Sound.SampleCount - RoundReal32ToInt32(PlayingSound->SamplesPlayed);
+
+                if(SamplesRemainingInSound < SamplesToMix)
+                {
+                    SamplesToMix = SamplesRemainingInSound;
+                }
+
+                b32 VolumeEnded[OutputChannelCount] = {};
+                for(s32 ChannelIndex = 0;
+                    ChannelIndex < OutputChannelCount;
+                    ++ChannelIndex)
+                {
+                    if(dVolume.E[ChannelIndex] != 0.0f)
+                    {
+                        f32 DeltaVolume = PlayingSound->TargetVolume.E[ChannelIndex] - Volume.E[ChannelIndex];
+                        s32 VolumeSampleCount = (s32)((DeltaVolume / dVolume.E[ChannelIndex]) + 0.5f);
+                        if(SamplesToMix > VolumeSampleCount)
+                        {
+                            SamplesToMix = VolumeSampleCount;
+                            VolumeEnded[ChannelIndex] = true;
+                        }
+                    }
+                }
+
+
+                for(s32 SampleIndex = RoundReal32ToInt32(PlayingSound->SamplesPlayed);
+                    SampleIndex < (PlayingSound->SamplesPlayed + SamplesToMix);
+                    ++SampleIndex)
+                {
+                    f32 SampleValue = Slot->Sound.Samples[0][SampleIndex];
+                    *Dest0++ += AudioState->MasterVolume.E[0]*Volume.E[0]*SampleValue;
+                    *Dest1++ += AudioState->MasterVolume.E[1]*Volume.E[1]*SampleValue;
+
+                    Volume += dVolume;
+                }
+
+                PlayingSound->CurrentVolume = Volume;
+
+                for(s32 ChannelIndex = 0;
+                    ChannelIndex < OutputChannelCount;
+                    ++ChannelIndex)
+                {
+                    if(VolumeEnded[ChannelIndex])
+                    {
+                            PlayingSound->CurrentVolume.E[ChannelIndex] = PlayingSound->TargetVolume.E[ChannelIndex];
+                            PlayingSound->dCurrentVolume.E[ChannelIndex] = 0.0f;
+                    }
+                }
+
+                Assert(TotalSamplesToMix >= SamplesToMix);
+                PlayingSound->SamplesPlayed += SamplesToMix;
+                TotalSamplesToMix -= SamplesToMix;
+
+                if(PlayingSound->SamplesPlayed == Slot->Sound.SampleCount)
+                {
+                    if(Info->NextIDToPlay.Value)
+                    {
+                        PlayingSound->ID = Info->NextIDToPlay;
+                        PlayingSound->SamplesPlayed = 0;
+                    }
+                    else
+                    {
+                        SoundFinished = true;
+                    }
+                }
+                else
+                {
+                    // Assert(TotalSamplesToMix == 0);
+                }
+            }
+            else
+            {
+                LoadSound(Assets, PlayingSound->ID);
+                break;
+            }
+        }
+
+        if(SoundFinished)
+        {
+            *PlayingSoundPtr = PlayingSound->Next;
+            PlayingSound->Next = AudioState->FirstFreePlayingSound;
+            AudioState->FirstFreePlayingSound = PlayingSound;
+        }
+        else
+        {
+            PlayingSoundPtr = &PlayingSound->Next;
+        }
+    }
+
+    {
+        f32 *Source0 = RealChannel0;
+        f32 *Source1 = RealChannel1;
+
+        s16 *SampleOut = Audio->Samples;
+        for(s32 SampleIndex = 0;
+            SampleIndex < Audio->SampleCount;
+            ++SampleIndex)
+        {
+            *SampleOut++ = (s16)(*Source0 + 0.5f); ++Source0;
+            *SampleOut++ = (s16)(*Source1 + 0.5f); ++Source1;
+        }
+    }
+
+    EndTemporaryMemory(MixerMemory);
+}
+
+function void
+InitializeAudioState(game_audio_state *AudioState, memory_arena *PermanentArena)
+{
+    AudioState->PermanentArena = PermanentArena;
+    AudioState->FirstPlayingSound = 0;
+    AudioState->FirstFreePlayingSound = 0;
+    AudioState->MasterVolume = V2(1.0f, 1.0f);
+}
